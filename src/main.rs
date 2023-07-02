@@ -9,6 +9,7 @@
 // }
 
 use crossbeam_deque::Worker;
+extern crate crossbeam_learn;
 
 fn main() {
     // 通过闭包和函数分别实现自增。
@@ -42,4 +43,7 @@ fn main() {
     assert!(w.is_empty());
     w.push(1);
     assert!(!w.is_empty());
+    let _y = crossbeam_learn::add(2,3);
+    crossbeam_learn::test_crossbeam_main();
+    crossbeam_learn::test_channel_main();
 }
