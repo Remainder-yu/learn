@@ -13,6 +13,7 @@ edition = "2021"
 # }
 
 [dependencies]
+crossbeam-deque = "0.8"
 
 # {
 #     "rust-analyzer.linkedProjects":[

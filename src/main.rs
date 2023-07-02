@@ -1,6 +1,4 @@
 // use std::num::ParseIntError;
-
-
 // fn add_two(n_str: &str) -> Result <i32 , ParseIntError> {
 //     n_str.parse::<i32>().
 // }
@@ -9,6 +7,8 @@
 //     assert_eq!(add_two("4").unwrap(),6);
 //     println!("sucess");
 // }
+
+use crossbeam_deque::Worker;
 
 fn main() {
     // 通过闭包和函数分别实现自增。
@@ -36,4 +36,10 @@ fn main() {
     // 返回类型是自动推导的。
     let one = || 1;
     println!("closure returning one: {}", one());
+
+    let w = Worker::new_lifo();
+
+    assert!(w.is_empty());
+    w.push(1);
+    assert!(!w.is_empty());
 }
