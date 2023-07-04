@@ -62,6 +62,7 @@ pub fn test_channel_main() {
         println!("Received {}", msg);
     }
     remainder_learn_channel::test_mod_channel();
+    remainder_learn_channel::test_scope_main();
 }
 
 
