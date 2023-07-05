@@ -1,0 +1,11 @@
+[package]
+name = "tokio_learn"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+# 开启全部功能的tokio，
+# 在了解tokio之后，只开启需要的特性，减少编译时间，减小编译大小
+tokio = {version = "1.4", features = ["full"]}
