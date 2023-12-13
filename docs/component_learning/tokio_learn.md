@@ -36,6 +36,8 @@ Rust入门秘籍
 知乎：深入浅出Rust异步编程之Tokio
 <https://zhuanlan.zhihu.com/p/107820568>
 
+[揭开Rust Tokio的神秘面纱](https://www.zhihu.com/search?type=content&q=%E6%8F%AD%E5%BC%80Rust%20Tokio%E7%9A%84%E7%A5%9E%E7%A7%98%E9%9D%A2%E7%BA%B1)
+
 ## 2.2. 框架
 
 tokio是一个基于Rust的异步编程框架，它提供了一组异步I/O、定时器和任务调度原语。tokio构建在rust的异步运行时（async runtime）之上，使用了非阻塞I/O和基于事件驱动的编程模型，使得开发者可以方便地编写高效异步代码。以下是一些Tokio框架的核心概念和组件：
@@ -93,6 +95,8 @@ Timer Wheel（定时器轮盘）：用于管理定时器任务的触发。定时
 ## 2.4. future
 
 future是rust异步编程的核心。首先我们介绍什么是future。future是一段异步计算程序，可以在将来获取产生的数据。举例来说，获取数据库查询结果，RPC调用这些实际上都可以使用future来实现。通常实现future有两种模式，一种基于推模式，也被称为基于完成的模式，一种基于拉模式，也被称为基于就绪的模式。Rust的future库实现了基于拉模式的future。
+
+
 
 
 

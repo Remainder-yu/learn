@@ -1,12 +1,25 @@
 # IO与异步编程
 异步可以提高CPU使用率。
-
 ![Alt text](./imgs/异步web服务器使用异步优点.png)
 
 ## I/O
 buffer是一个数组，因此可以读取的最大长度编码在类型信息中。
+
+
 ## 异步概念基础
+背景：
+异步编程时一个并发编程模型，异步编程允许我们同时运行大量的任务，却仅仅需要几个甚至一个OS线程或CPU核心，现代化的异步编程在使用体验上跟同步编程几乎无区别。
+
 根据异步运行时的调度方式决定，是否使用多个CPU核。
+
+并发模型：
+* OS模型
+* 事件驱动模型
+* 协程
+* actor模型
+* async/await
+
+
 
 编写代码难度提高，调度需要一个过程。
 ## 异步基础
@@ -45,6 +58,33 @@ fn main() {
 * 不同于block_on，.await是异步等待，不阻塞当前线程，此时可以调度其他异步任务。
 
 .await可以实现当前任务执行过程中调度出去，然后只要其他有可执行异步任务，就可以执行其他异步任务。
+```rust
+use futures::executor::block_on;
+
+async fn hello_world() {
+    hello_cat().await; //如果这里没有这个await，那么就会报错，因为这里返回的Future没有任何人执行它
+    println!("hello, world!");
+}
+
+async fn hello_cat() {
+    println!("hello, kitty!");
+}
+fn main() {
+    let future = hello_world();
+    block_on(future);
+}
+```
+两种解决方法：使用.await语法或者对Future进行轮询(poll)。
+为hello_cat()添加上.await后，结果立刻大为不同:
+
+hello, kitty!
+hello, world!
+输出的顺序跟代码定义的顺序完全符合，因此，我们在上面代码中使用同步的代码顺序实现了异步的执行效果，非常简单、高效，而且很好理解，未来也绝对不会有回调地狱的发生。
+
+总之，在async fn函数中使用.await可以等待另一个异步调用的完成。但是与block_on不同，.await并不会阻塞当前的线程，而是异步的等待Future A的完成，在等待的过程中，该线程还可以继续执行其它的Future B，最终实现了并发处理的效果。
+
+[Rust语言圣经](https://course.rs/advance/async/getting-started.html)
+
 #### 异步调用
 ![Alt text](./imgs/异步调用.png)
 
