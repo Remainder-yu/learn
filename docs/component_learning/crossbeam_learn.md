@@ -27,7 +27,7 @@ CAS（compare and swap）原语
 ```rust
 pub fn compare_and_swap(
     &self,
-    current: *mut T,)
+    current: *mut T,
     new: *mut T,
     order: Ordering
 ) -> *mut T
@@ -306,8 +306,6 @@ Cell是rust标准库中的一个类型，用于提供内部可变性。它允许
 在Backoff结构体中，step字段用于记录当前自旋等待的步数。它允许我们在不可变引用的情况下修改其内部的值。
 在Backoff结构体中，step字段用于记录当前自旋等待的步数。在自旋等待的过程中，可以使用step字段来控制自旋等待的策略，例如每次自旋等待时递增步数，以实现一种退避backoff策略。
 通过使用Backoff结构体，可以在并发编程中实现一种简单的自旋等待机制。这种机制可以用于等待某个条件的满足，以避免线程频繁地进行无效的轮询。通过适当地调整自旋等待的策略，可以在一定程度上提高并发程序的性能。
-
-
 
 # crossbeam scope
 ```rust
