@@ -20,3 +20,52 @@ steal变量表示从n中提取的表示stealer正在处理位置的索引。它�
 ```rust
 
 ```
+
+## Cargo.toml
+
+work_stealing:
+怎么拿（如何获取task）：
+全局队列：
+本地队列：
+通过steal：
+
+runtime中的thread_pool如何调入task？
+
+
+12.19：
+
+## mio--
+io：async_fd：
+driver就是为了实现通知的结果。
+
+poll方法就会重新进行poll：
+
+```rust
+        match self.poll.poll(events, max_wait) {
+            Ok(()) => {}
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => {}
+            #[cfg(target_os = "wasi")]
+            Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                // In case of wasm32_wasi this error happens, when trying to poll without subscriptions
+                // just return from the park, as there would be nothing, which wakes us up.
+            }
+            Err(e) => panic!("unexpected error when polling the I/O driver: {:?}", e),
+        }
+```
+readiness怎么去做唤醒？
+turn函数？
+driver--是不是和mio绑定。
+
+tokio对外原则，封装不暴露？ 对下面库的封装，为了安全。
+driver：怎么调度起来？
+
+driver中的pack？怎么调用？
+
+ driver如何实现调度？
+ wake？readiness--标记是否可以使用？
+ driver可以理解位reactor，如何理解reactor？
+ 为什么READINESS执行位运算？为什么放在一个变量，原因在于原子，可以在一个地方替换？无锁数据结构，为了利用原子操作。
+ 为了配合硬件效率。。。
+
+ loom：测试框架。
+ 哪里用户调用？哪里是driver调用？
