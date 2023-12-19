@@ -19,7 +19,7 @@ buffer是一个数组，因此可以读取的最大长度编码在类型信息�
 * actor模型
 * async/await
 
-
+少数线程支撑大量任务。可执行文件大（需要生成状态机，每个可执行文件捆绑一个异步运行时）
 
 编写代码难度提高，调度需要一个过程。
 ## 异步基础
@@ -135,6 +135,19 @@ enum Poll<T> {
 ```
 * Future特型是Rust异步编程的核心
 * Future对象是一项异步计算任务，能够返回一个结果，有可能中间会停顿断开，切换任务。
+
+Future代表着一种你可以检验其是否完成的操作，Future可以通过调用poll函数来取地进展
+* poll函数会驱动Future尽可能接近完成
+* 如果Future完成了：就返回poll::Ready(result),其中result就是最终的结果。
+* 如果Future还无法完成：就返回poll::Pending,并当Future准备好取得更多进展时调用一个waker的wake()函数
+
+针对Future，你唯一能做的就是使用poll来敲打它，直到一个值掉出来。
+
+## 用waker唤醒任务
+* Waker提供了wake方法，它可以被用来告诉执行者：相关的任务应该被唤醒
+* 当wake()被调用，执行者知道Waker所关联的任务已经准备好取得更多进展，Future应该被再次poll
+* Waker实现了clone(),可以复制和存储。
+
 
 ## 执行器的视角
 
