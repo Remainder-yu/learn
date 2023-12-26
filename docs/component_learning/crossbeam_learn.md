@@ -409,3 +409,445 @@ fn main() {
 ```
 需要注意的是，对于`MaybeUninit<T>`类型的值进行读取操作前，必须确保它已经被正确初始化，否则可能会导致未定义行为。
 
+# 概述
+crossbeam-qeue分为两种无锁队列，一种是利用数组实现，一种是链表实现。
+基于数据实现有限队列性能更高。
+基于链表实现的无限队列，因为需要动态分配所以性能较差。
+从两种数据结构的封装开始分析。
+
+两种数据结构都是无锁队列，基于原子操作实现，所以性能较高。其中包括crossbeam特有得一些技巧。
+
+# array_queue
+
+其中主要的数据结构：`pub struct ArrayQueue<T> `，其中除了位置标记参数和容量属性等，最为核心就是存放数据成员的`struct Slot<T>`。其主要封装结构如下：
+
+```rust
+/// A slot in a queue.
+struct Slot<T> {
+    /// The current stamp.
+    ///
+    /// If the stamp equals the tail, this node will be next written to. If it equals head + 1,
+    /// this node will be next read from.
+    stamp: AtomicUsize,
+
+    /// The value in this slot.
+    value: UnsafeCell<MaybeUninit<T>>,
+}
+
+pub struct ArrayQueue<T> {
+    /// The head of the queue.
+    ///
+    /// This value is a "stamp" consisting of an index into the buffer and a lap, but packed into a
+    /// single `usize`. The lower bits represent the index, while the upper bits represent the lap.
+    ///
+    /// Elements are popped from the head of the queue.
+    head: CachePadded<AtomicUsize>,
+
+    /// The tail of the queue.
+    ///
+    /// This value is a "stamp" consisting of an index into the buffer and a lap, but packed into a
+    /// single `usize`. The lower bits represent the index, while the upper bits represent the lap.
+    ///
+    /// Elements are pushed into the tail of the queue.
+    tail: CachePadded<AtomicUsize>,
+
+    /// The buffer holding slots.
+    buffer: Box<[Slot<T>]>,
+
+    /// The queue capacity.
+    cap: usize,
+
+    /// A stamp with the value of `{ lap: 1, index: 0 }`.
+    one_lap: usize,
+}
+```
+由于该结构体需要线程同步，所以需要实现：send,sync等特征trait。
+
+针对`ArrayQueue<T>`结构体主要方法：
+```rust
+// 核心成员方法，分析以下几个即可
+pub fn new(cap: usize) -> Self { }
+fn push_or_else<F>(&self, mut value: T, f: F) -> Result<(), T>
+pub fn push(&self, value: T) -> Result<(), T>
+pub fn force_push(&self, value: T) -> Option<T>
+pub fn pop(&self) -> Option<T>
+
+pub fn capacity(&self) -> usize
+pub fn is_empty(&self) -> bool
+pub fn is_full(&self) -> bool
+pub fn len(&self) -> usize
+```
+
+### new
+
+```rust
+// One lap is the smallest power of two greater than cap.
+        let one_lap = (cap + 1).next_power_of_two();·
+```
+这段代码的作用是计算一个大于cap的最小的2的幂值。
+具体来说，cap表示一个容量（通常是作为分配或缓冲区大小的参考）。使用(cap + 1).next_power_of_two()表达式可以找到一个比cap大的最小2的幂值。
+代码中的处理过程如下：
+1. 将cap的值加1，保证了当cap本身就是2的幂时，不会返回原来的值。
+2. 然后使用.next_power_of_two()方法计算出最小的2的幂值，即大于等于cap + 1的最小2的幂。
+例如，假设cap的值为5：
+首先，将5加1得到6。
+接着，找到大于等于6的最小的2的幂值，即8。
+所以，经过这段代码后，one_lap的值将为8，它是大于5的最小的2的幂。这样的计算通常用于优化内存分配或缓冲区的大小，以提供更高效的操作和资源利用。
+
+### push
+
+```rust
+pub fn push(&self, value: T) -> Result<(), T>
+--> fn push_or_else<F>(&self, mut value: T, f: F) -> Result<(), T>
+
+    pub fn push(&self, value: T) -> Result<(), T> {
+        self.push_or_else(value, |v, tail, _, _| {
+            let head = self.head.load(Ordering::Relaxed);
+
+            // If the head lags one lap behind the tail as well...
+            if head.wrapping_add(self.one_lap) == tail {
+                // ...then the queue is full.
+                Err(v)
+            } else {
+                Ok(v)
+            }
+        })
+    }
+
+//
+pub fn force_push(&self, value: T) -> Option<T>
+--> fn push_or_else<F>(&self, mut value: T, f: F) -> Result<(), T>
+```
+
+#### 核心函数详细分析：
+
+由`pub fn push(&self, value: T) -> Result<(), T>`直接调用push_or_else函数。核心参数就是针对Array_queue进队value参数。
+主要思路：
+1. 建立Backoff::new();和获取当前队列的tail索引标记位。
+2. 进入主循环：
+   1. 获取tail的index和圈数，圈数是为了区分head和tail，因为当前队列类似操作ringbuffer。（tail只是标记位，真正获取slot，通过index获取）
+   2. 获取new_tail,如果当前index+1小于self.cap，说明还在一个圈数内部，直接tail+1为new_tail;
+   3. 如果index+1 > self.cap,说明当前tail的index大于缓冲区长度，此时new_tail就是lap.wrapping_add(self.one_lap),类似索引位和标记位区别。就是超过了one_lap.
+   4. 获取index指向的slot和stamp
+      * tail == stamp：If the tail and the stamp match, we may attempt to push
+      * stamp.wrapping_add(self.one_lap) == tail + 1 ： 如果stamp和tail+1相差self.one_lap，表示槽位slot的stamp已经循环了初始位置，而tail+1表示tail已经移动了一圈
+      * 其他情况：如果以上两个条件都不满足，则需要等待stamp更新，进行退避等待
+
+```rust
+    fn push_or_else<F>(&self, mut value: T, f: F) -> Result<(), T>
+    where
+        F: Fn(T, usize, usize, &Slot<T>) -> Result<T, T>,
+    {
+        let backoff = Backoff::new();
+        let mut tail = self.tail.load(Ordering::Relaxed);
+
+        loop {
+            // Deconstruct the tail.
+            let index = tail & (self.one_lap - 1);
+            let lap = tail & !(self.one_lap - 1);
+
+            let new_tail = if index + 1 < self.cap {
+                // Same lap, incremented index.
+                // Set to `{ lap: lap, index: index + 1 }`.
+                tail + 1
+            } else {
+                // One lap forward, index wraps around to zero.
+                // Set to `{ lap: lap.wrapping_add(1), index: 0 }`.
+                lap.wrapping_add(self.one_lap)
+            };
+
+            // Inspect the corresponding slot.
+            debug_assert!(index < self.buffer.len());
+            let slot = unsafe { self.buffer.get_unchecked(index) };
+            let stamp = slot.stamp.load(Ordering::Acquire);
+
+            // If the tail and the stamp match, we may attempt to push.
+            if tail == stamp {
+                // Try moving the tail.
+                match self.tail.compare_exchange_weak(
+                    tail,
+                    new_tail,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        // Write the value into the slot and update the stamp.
+                        unsafe {
+                            slot.value.get().write(MaybeUninit::new(value));
+                        }
+                        slot.stamp.store(tail + 1, Ordering::Release);
+                        return Ok(());
+                    }
+                    Err(t) => {
+                        tail = t;
+                        backoff.spin(); // 进行自旋等待
+                    }
+                }
+            } // 如果stamp和tail+1相差self.one_lap，表示槽位slot的stamp已经循环了初始位置，而tail+1表示tail已经移动了一圈
+            else if stamp.wrapping_add(self.one_lap) == tail + 1 {
+                // 全局的内存屏障，确保在将value写入slot之前，所有访问顺序的一致
+                atomic::fence(Ordering::SeqCst); // 通过内存屏障，能够保证数据的正确性并避免竞态条件的发生
+                // 调用指定的回调函数f对value、tail、new_tail和slot进行处理，获取新的value。
+                value = f(value, tail, new_tail, slot)?;
+                backoff.spin();
+                tail = self.tail.load(Ordering::Relaxed); //进行自旋等待并更新tail的值。
+                // 在内存屏障之后，还调用了一个回调函数f，该函数通过处理value、tail、new_tail和slot等参数，可以对数据进行进一步处理。
+                // 这个回调函数的作用是确保在推送数据之前，对数据进行一些额外的处理操作，以满足特定的需求。
+            } else {
+                // Snooze because we need to wait for the stamp to get updated.
+                backoff.snooze(); // 如果以上两个条件都不满足，则需要等待stamp更新，进行退避等待
+                tail = self.tail.load(Ordering::Relaxed);
+            }
+        }
+    }
+
+```
+
+
+### pop
+主要流程：
+1. 创建backoff = Backoff::new(); 获取head标记位
+2. 进入主循环，直到成功弹出一个元素或者获取到一个非空的通道。
+   1. 首先从head变量中提取出索引和lap两个值。
+   2. 使用索引值从缓冲区中获取到对应的槽位slot。
+   3. 检查槽位中存储的stamp值，如果该值比head大1，则说明可以尝试弹出一个元素。
+   4. 如果当前索引加1小于缓冲区长度，则新的head值为head加1，否则新的head值为lap加一个循环（也就是队列实际长度）的长度。
+   5. 使用compare_exchange_weak原子操作尝试更新head的值为新的head值，如果成功，则说明成功移动了head指针。
+   6. 在更新head指针成功后，从槽位中读取值，并更新stamp的值为head加上一个循环的长度。然后返回该值作为pop函数的结果。
+   7. 如果更新head指针失败，则说明其他线程已经修改了head的值，需要重新获取新的head值，并进行退避策略。
+   8. 如果stamp与head相等，则说明通道为空，返回None表示无法弹出元素。
+   9. 如果stamp与head不相等，说明需要等待stamp值更新，进行退避策略，然后重新获取新的head值。
+重复以上步骤进行下一轮循环，直到成功弹出元素或者获取到非空通道。
+代码实现如下：
+```rust
+   pub fn pop(&self) -> Option<T> {
+        let backoff = Backoff::new();
+        let mut head = self.head.load(Ordering::Relaxed);
+
+        loop {
+            // Deconstruct the head.
+            let index = head & (self.one_lap - 1);
+            let lap = head & !(self.one_lap - 1);
+
+            // Inspect the corresponding slot.
+            debug_assert!(index < self.buffer.len());
+            let slot = unsafe { self.buffer.get_unchecked(index) };
+            let stamp = slot.stamp.load(Ordering::Acquire);
+
+            // If the the stamp is ahead of the head by 1, we may attempt to pop.
+            if head + 1 == stamp {
+                let new = if index + 1 < self.cap { // 如果当前索引+1小于缓冲区长度，
+                    // Same lap, incremented index.
+                    // Set to `{ lap: lap, index: index + 1 }`.
+                    head + 1
+                } else {
+                    // One lap forward, index wraps around to zero.
+                    // Set to `{ lap: lap.wrapping_add(1), index: 0 }`.
+                    lap.wrapping_add(self.one_lap) // head值为lap加一个循环的长度。
+                };
+
+                // Try moving the head.
+                match self.head.compare_exchange_weak(
+                    head,
+                    new,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => {
+                        // Read the value from the slot and update the stamp.
+                        let msg = unsafe { slot.value.get().read().assume_init() };
+                        slot.stamp
+                            .store(head.wrapping_add(self.one_lap), Ordering::Release);
+                        return Some(msg);
+                    }
+                    Err(h) => {
+                        // 如果更新失败说明其他线程已经修改了head的值，需要重新获取新的head值，并进行退避策略
+                        head = h;
+                        backoff.spin();
+                    }
+                }
+            } else if stamp == head { // stamp值与head不相等，则说明通道为空，返回None表示无法弹出元素
+                atomic::fence(Ordering::SeqCst);
+                let tail = self.tail.load(Ordering::Relaxed);
+
+                // If the tail equals the head, that means the channel is empty.
+                if tail == head {
+                    return None;
+                }
+
+                backoff.spin();
+                head = self.head.load(Ordering::Relaxed);
+            } else { // 如果stamp与head不相等，说明需要等待stamp值更新，进行退避策略，然后重新获取新的head值。
+                // Snooze because we need to wait for the stamp to get updated.
+                backoff.snooze();
+                head = self.head.load(Ordering::Relaxed);
+            }
+        }
+    }
+```
+
+# seg_queue
+
+该部分主要是用链表实现队列。
+实现了一个基于块的无锁队列，通过头指针和块指针来实现pop操作的原子性和线程安全性。pop操作会从队列头部取出一个元素，并将头指针移动到下一个位置。如果队列为空，pop操作会返回None。
+
+## 主要数据结构
+
+### slot
+```rust
+struct Slot<T> {
+    /// The value.
+    value: UnsafeCell<MaybeUninit<T>>,
+
+    /// The state of the slot.
+    state: AtomicUsize,
+}
+```
+
+### Block
+```rust
+struct Block<T> {
+    /// The next block in the linked list.
+    next: AtomicPtr<Block<T>>,
+
+    /// Slots for values.
+    slots: [Slot<T>; BLOCK_CAP],
+}
+
+```
+### Position
+```rust
+/// A position in a queue.
+struct Position<T> {
+    /// The index in the queue.
+    index: AtomicUsize,
+
+    /// The block in the linked list.
+    block: AtomicPtr<Block<T>>,
+}
+```
+
+### SegQueue
+```rust
+pub struct SegQueue<T> {
+    /// The head of the queue.
+    head: CachePadded<Position<T>>,
+
+    /// The tail of the queue.
+    tail: CachePadded<Position<T>>,
+
+    /// Indicates that dropping a `SegQueue<T>` may drop values of type `T`.
+    _marker: PhantomData<T>,
+}
+```
+
+## 编程技巧
+
+```rust
+let offset = (tail >> SHIFT) % LAP;
+```
+用于确定下一个元素将被写入到缓冲区中的哪个位置。
+具体而言，这个表达式分为两个步骤：
+* tail >> SHIFT：通过右移操作符>>，将tail的值向右移动SHIFT位。tail表示队尾的索引值，而SHIFT是一个常数，用于确定每个索引需要存储在缓冲区中的位数。通过右移操作符，可以将tail转换为缓冲区的索引范围内。
+* % LAP：计算上一步结果与常数LAP之间的模运算。LAP是一个在队列实现中使用的掩码，它确定了缓冲区的大小。通过计算模运算，可以将上一步得到的索引值归入合适范围内，确保它不会超过缓冲区的边界。
+综合而言，通过这个计算，offset可以得到下一个元素在缓冲区中的写入位置，从而实现了循环队列的功能。这是因为缓冲区的存储是循环的，当索引超过缓冲区边界时，会回到缓冲区的起始位置，形成循环。
+
+```rust
+            // Try advancing the tail forward.
+            match self.tail.index.compare_exchange_weak(
+                tail,
+                new_tail,
+                Ordering::SeqCst,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => unsafe {
+                    // If we've reached the end of the block, install the next one.
+                    if offset + 1 == BLOCK_CAP {
+                        let next_block = Box::into_raw(next_block.unwrap());
+                        let next_index = new_tail.wrapping_add(1 << SHIFT);
+
+                        self.tail.block.store(next_block, Ordering::Release);
+                        self.tail.index.store(next_index, Ordering::Release);
+                        (*block).next.store(next_block, Ordering::Release);
+                    }
+
+                    // Write the value into the slot.
+                    let slot = (*block).slots.get_unchecked(offset);
+                    slot.value.get().write(MaybeUninit::new(value));
+                    slot.state.fetch_or(WRITE, Ordering::Release);
+
+                    return;
+                },
+                Err(t) => {
+                    tail = t;
+                    block = self.tail.block.load(Ordering::Acquire);
+                    backoff.spin();
+                }
+            }
+```
+这段代码段展示了对环形缓冲区中的tail指针进行推进（advance）的过程。它使用了原子操作和无序的内存访问来确保的正确性和性能。
+首先，代码使用compare_exchange_weak函数尝试原子地更新tail.index的值。如果当前的tail.index的值与传入的tail相等，那么将其更新为new_tail的值。这个操作使用SeqCst（顺序一致性）和Acquire（获取语义）内存序，以确保正确的同步和顺序性。如果更新成功，接下来的代码将会执行。
+在成功更新tail.index之后，代码首先检查是否达到了环形缓冲区的末尾位置。如果offset + 1 == BLOCK_CAP为真，说明已经到达了当前块的末尾，需要安装下一个块。
+接下来，代码通过使用Box::into_raw将next_block转换为原始指针，并使用new_tail.wrapping_add(1 << SHIFT)计算下一个块的索引位置。然后，将next_block和next_index分别存储到self.tail.block和self.tail.index中，并使用Release内存序进行存储，以确保对这些存储的修改对其他线程可见。
+接着，代码将当前块的next字段设置为next_block，同样使用Release内存序。
+然后，代码将value写入到当前偏移位置的插槽（slot）中。它使用get_unchecked函数来获取插槽的引用，但是因为此处使用了unsafe代码块，需要确保在使用之前已正确验证索引的有效性。之后，代码使用write方法将value的值写入到插槽中，并使用Release内存序设置插槽的状态为WRITE。
+最后，代码通过return语句退出函数。
+如果compare_exchange_weak操作失败（即Err(t)），说明其他线程已经修改了tail.index的值，那么代码将更新tail和block的值，并通过自旋等待来重新尝试操作，这里使用了backoff变量的spin方法来进行自旋等待。
+总体而言，这段代码实现了一种并发安全且高效的环形缓冲区的推进操作，它利用原子操作和无序内存访问来确保多线程环境下对tail指针的正确管理。
+
+## pop
+
+```rust
+            // Try moving the head index forward.
+            match self.head.index.compare_exchange_weak(
+                head,
+                new_head,
+                Ordering::SeqCst,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => unsafe {
+                    // If we've reached the end of the block, move to the next one.
+                    if offset + 1 == BLOCK_CAP {
+                        let next = (*block).wait_next();
+                        let mut next_index = (new_head & !HAS_NEXT).wrapping_add(1 << SHIFT);
+                        if !(*next).next.load(Ordering::Relaxed).is_null() {
+                            next_index |= HAS_NEXT;
+                        }
+
+                        self.head.block.store(next, Ordering::Release);
+                        self.head.index.store(next_index, Ordering::Release);
+                    }
+
+                    // Read the value.
+                    let slot = (*block).slots.get_unchecked(offset);
+                    slot.wait_write();
+                    let value = slot.value.get().read().assume_init();
+
+                    // Destroy the block if we've reached the end, or if another thread wanted to
+                    // destroy but couldn't because we were busy reading from the slot.
+                    if offset + 1 == BLOCK_CAP {
+                        Block::destroy(block, 0);
+                    } else if slot.state.fetch_or(READ, Ordering::AcqRel) & DESTROY != 0 {
+                        Block::destroy(block, offset + 1);
+                    }
+
+                    return Some(value);
+                },
+                Err(h) => {
+                    head = h;
+                    block = self.head.block.load(Ordering::Acquire);
+                    backoff.spin();
+                }
+            }
+
+```
+首先，代码使用compare_exchange_weak方法比较并交换self.head.index的值。如果成功，接下来进行一些操作，否则，代码会根据返回的新值进行后续处理。这个部分通常是一个自旋锁来等待其他线程释放资源。
+
+* 在成功进行比较并交换后，代码检查偏移量offset是否为BLOCK_CAP - 1。
+  * 如果是，说明已经到达了当前块的末尾。在这种情况下，它会获取下一个块的引用，并计算下一个块的索引next_index。如果下一个块的next指针不为空，则设置HAS_NEXT位。然后，通过self.head.block.store方法将下一个块的引用存储到self.head.block中，通过self.head.index.store方法将计算得到的next_index存储到self.head.index中。
+  * 接下来，代码通过指针操作访问了块中的槽位，并获取了槽位中的值。然后，根据当前的偏移量判断是否需要销毁当前块。如果是块的末尾，调用Block::destroy方法销毁块，否则，如果其他线程已经标记要销毁块，调用Block::destroy方法销毁块，并指定销毁的偏移量。
+最后，代码返回从槽位中读取到的值。
+
+问题1：销毁的过程？
+
+
