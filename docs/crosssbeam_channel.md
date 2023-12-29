@@ -68,3 +68,203 @@ pub(crate) struct Entry {
 参考文献：
 https://xiaopengli89.github.io/posts/crossbeam-channel/
 [Crossbeam的无锁并发Channel解析](https://xiaopengli89.github.io/posts/crossbeam-channel/)
+
+# channel
+
+```rust
+            Context::with(|cx| {
+                // Prepare for blocking until a receiver wakes us up.
+                let oper = Operation::hook(token);
+                self.senders.register(oper, cx);
+
+                // Has the channel become ready just now?
+                if !self.is_full() || self.is_disconnected() {
+                    let _ = cx.try_select(Selected::Aborted);
+                }
+
+                // Block the current thread.
+                let sel = cx.wait_until(deadline);
+
+                match sel {
+                    Selected::Waiting => unreachable!(),
+                    Selected::Aborted | Selected::Disconnected => {
+                        self.senders.unregister(oper).unwrap();
+                    }
+                    Selected::Operation(_) => {}
+                }
+
+```
+在crossbeam-channel/src/flavors/array.rs中的line332的send函数中可知，在发送过程中，会进行本地的上下文获取Context::with(|cx|，然后注册至syncWaker中，接下来需要进入waker.rs中进行分析。然后就会注册至self.register_with_packet(oper, ptr::null_mut(), cx);注册到self.selectors.push。这个就是context与waker之间的主要关系，实现了休眠唤醒的实现。
+
+主要问题是：select又是怎么实现了channel的可选择执行？
+
+
+## select
+
+在SelectedOperation结构体中，最重要的就是index参数，可以通过该参数找到对应的sender或者receiver。例如：let oper = sel.select();获得了SelectedOperation<'a>，然后根据oper.recv(&r2)找到对应的接收通道。
+```rust
+pub struct SelectedOperation<'a> {
+    /// Token needed to complete the operation.
+    token: Token,
+
+    /// The index of the selected operation.
+    index: usize,
+
+    /// The address of the selected `Sender` or `Receiver`.
+    ptr: *const u8,
+
+    /// Indicates that `Sender`s and `Receiver`s are borrowed.
+    _marker: PhantomData<&'a ()>,
+}
+```
+找到接收通道了，然后执行channel::read(r, &mut self.token)，即可通过该操作获取channel对应相关的操作。select操作只是为了在多个channel找到可以读取或者写入那个channel。相当于channel内部做了一次管理，让channel传输数据更加有效。
+```rust
+    pub fn recv<T>(mut self, r: &Receiver<T>) -> Result<T, RecvError> {
+        assert!(
+            r as *const Receiver<T> as *const u8 == self.ptr,
+            "passed a receiver that wasn't selected",
+        );
+        let res = unsafe { channel::read(r, &mut self.token) };
+        mem::forget(self);
+        res.map_err(|_| RecvError)
+    }
+
+```
+通过channel-select的联合，我们可以认知到select的作用。
+
+
+### trait SelectHandle
+在crossbeam-channel/src/select.rs文件中，定义了trait SelectHandle，也就是select的一些基本操作。
+然后`impl<T: SelectHandle> SelectHandle for &T`实现了操作，
+
+例如，`impl<T> SelectHandle for Receiver<'_, T>`，针对Receiver实现了trait SelectHandle，而Receiver由`pub(crate) struct Receiver<'a, T>(&'a Channel<T>);`封装,以针对Receiver实现的watch为例，watch注册channel的receiver端事件。
+```rust
+impl<T> SelectHandle for Receiver<T> {
+
+    fn watch(&self, oper: Operation, cx: &Context) -> bool {
+        match &self.flavor {
+            ReceiverFlavor::Array(chan) => chan.receiver().watch(oper, cx),
+            ReceiverFlavor::List(chan) => chan.receiver().watch(oper, cx),
+            ReceiverFlavor::Zero(chan) => chan.receiver().watch(oper, cx),
+            ReceiverFlavor::At(chan) => chan.watch(oper, cx),
+            ReceiverFlavor::Tick(chan) => chan.watch(oper, cx),
+            ReceiverFlavor::Never(chan) => chan.watch(oper, cx),
+        }
+    }
+}
+怎么通过array-channel调用到chan.receiver().watch(oper, cx)；
+    /// Returns a receiver handle to the channel.
+    pub(crate) fn receiver(&self) -> Receiver<'_, T> {
+        Receiver(self)
+    }
+
+然后调用： ReceiverFlavor::Array(chan) => chan.receiver().watch(oper, cx),
+针对array：
+    fn watch(&self, oper: Operation, cx: &Context) -> bool {
+        self.0.receivers.watch(oper, cx);
+        self.is_ready()
+    }
+
+根据channel的receivers：syncWaker成员调用对应的watch注册等待时间：
+impl syncWaker {
+        pub(crate) fn watch(&self, oper: Operation, cx: &Context) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.watch(oper, cx);
+        self.is_empty.store(
+            inner.selectors.is_empty() && inner.observers.is_empty(),
+            Ordering::SeqCst,
+        );
+    }
+}
+
+然后调用：
+impl Waker {
+    pub(crate) fn watch(&mut self, oper: Operation, cx: &Context) {
+        self.observers.push(Entry {
+            oper,
+            packet: ptr::null_mut(),
+            cx: cx.clone(),
+        });
+    }
+}
+
+```
+
+### notify-waker的实现
+针对array-channel中，send函数会调用write将数据msg写入通道，然后调用Context::with获取当前上下文环境，然后将channel对应的sender注册self.senders.register(oper, cx);操作类型Operation::hook(token);返回的就是pub struct Operation(usize);类型，然后阻塞当前线程let sel = cx.wait_until(deadline);
+根据wait_until返回的Selected具体的枚举类型执行对应的操作。针对Selected::Operation(_) => {}，说明operation不做任何操作。
+
+同时在send发送过程中，循环执行let res = unsafe { self.write(token, msg) };其中write写入数据至通道，完成后唤醒接收端self.receivers.notify();整个唤醒过程后续分析：
+主要核心就是entry.cx.unpark(); //通知相关线程可以执行被选择的操作。怎么唤醒对应的操作呢，就是entry.cx.try_select(Selected::Operation(entry.oper))找到对应的entry。
+
+其实在注册过程中，self.senders.register(oper, cx);就将operation与context绑定在一起然后后续唤醒可以通过operation匹配对应的context。
+
+所以send过程写入操作过程唤醒对方，然后同时确定是否需要阻塞自己并注册至waker。
+
+然后如果需要分析详细过程，需要分析waker源码。
+
+```rust
+pub enum Selected {
+    /// Still waiting for an operation.
+    Waiting,
+
+    /// The attempt to block the current thread has been aborted.
+    Aborted,
+
+    /// An operation became ready because a channel is disconnected.
+    Disconnected,
+
+    /// An operation became ready because a message can be sent or received.
+    Operation(Operation),
+}
+
+    /// Writes a message into the channel.
+    pub(crate) unsafe fn write(&self, token: &mut Token, msg: T) -> Result<(), T> {
+        // If there is no slot, the channel is disconnected.
+        if token.array.slot.is_null() {
+            return Err(msg);
+        }
+
+        let slot: &Slot<T> = unsafe { &*token.array.slot.cast::<Slot<T>>() };
+
+        // Write the message into the slot and update the stamp.
+        unsafe { slot.msg.get().write(MaybeUninit::new(msg)) }
+        slot.stamp.store(token.array.stamp, Ordering::Release);
+
+        // Wake a sleeping receiver.
+        self.receivers.notify();
+        Ok(())
+    }
+
+```
+唤醒接收端之前将自己注册至syncwaker，然后一直阻塞当前线程cx.wait_until(deadline);
+
+```rust
+                Context::with(|cx| {
+                // Prepare for blocking until a receiver wakes us up.
+                let oper = Operation::hook(token);
+                self.senders.register(oper, cx);
+
+                // Has the channel become ready just now?
+                if !self.is_full() || self.is_disconnected() {
+                    let _ = cx.try_select(Selected::Aborted);
+                }
+
+                // Block the current thread.
+                let sel = cx.wait_until(deadline);
+
+                match sel {
+                    Selected::Waiting => unreachable!(),
+                    Selected::Aborted | Selected::Disconnected => {
+                        self.senders.unregister(oper).unwrap();
+                    }
+                    Selected::Operation(_) => {}
+                }
+            });
+```
+这段代码中，首先使用Context::with方法创建一个上下文cx，用于管理并发操作。
+接下来，创建一个代表发送操作的Operation对象oper，并将其注册到self.senders（发送者集合）中，以便执行该操作。
+然后，检查通道是否已满或者是否已断开连接。如果通道未满或者已断开连接，尝试用cx.try_select(Selected::Aborted)来选择一个操作，表示发送操作中止。
+接着，使用cx.wait_until(deadline)方法阻塞当前线程，等待直到指定的截止时间。
+最后，根据sel的不同取值，执行对应的操作。如果sel为Selected::Aborted或Selected::Disconnected，表示发送操作被取消，需要从发送者集合中注销该操作；如果sel为Selected::Operation(_)，表示操作执行成功；如果sel为Selected::Waiting，表示出现了意外情况，即代码无法到达的位置，使用unreachable!()宏触发panic。
+需要注意，sel是在cx.wait_until(deadline)方法中确定的，代表在指定的截止时间内选择的操作。具体的选择逻辑是由Context和相关操作句柄协同完成的。这里的代码片段没有给出Selected的定义，但可以假设Selected是一个枚举类型，表示选择操作的结果。
