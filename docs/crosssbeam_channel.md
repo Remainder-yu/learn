@@ -23,10 +23,6 @@ zero – 零容量通道。该通道没有缓冲区，发送方和接收方必�
 
 ## array
 
-
-
-
-
 # waker篇
 Q1：crossbeam中的waker唤醒机制原理？基于thread::park和unpark？unpark原理又是什么？
 Crossbeam是一个用于并发编程的Rust库，其中包含了一些用于线程同步和通信的原语。在Crossbeam中，Waker是一种唤醒机制，用于在线程间进行通信和唤醒操作。
